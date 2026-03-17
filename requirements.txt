@@ -1,0 +1,7 @@
+﻿fastapi==0.115.8
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+openai==1.68.2
+faiss-cpu==1.10.0
+numpy==2.2.3
+pypdf==5.4.0
