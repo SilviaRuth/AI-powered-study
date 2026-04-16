@@ -9,6 +9,7 @@
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/rag-upgrade.css" />
   </head>
   <body>
     <main class="app-shell container py-4 py-lg-5">
@@ -48,11 +49,21 @@
 
             <hr class="my-4" />
 
+            <div class="d-flex align-items-center justify-content-between mb-3">
+              <h2 class="h5 mb-0">Indexed Documents</h2>
+              <button id="rebuild-indexes" class="btn btn-sm btn-outline-light">
+                Rebuild
+              </button>
+            </div>
+            <div id="documents-list" class="documents-list mb-4"></div>
+
+            <hr class="my-4" />
+
             <h2 class="h5 mb-3">How It Works</h2>
             <p class="small text-muted mb-0">
-              The app chunks your documents, creates embeddings, stores them in
-              FAISS, retrieves the most relevant sections, and sends only that
-              context to the model.
+              The app parses pages, builds metadata-rich chunks, fuses dense and
+              BM25 retrieval, optionally reranks evidence, and answers with
+              compact citations.
             </p>
           </div>
         </section>
@@ -81,6 +92,8 @@
     </main>
 
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-    <script src="/static/chat.js"></script>
+    <script src="/static/chat-app.js"></script>
+    <script src="/static/upload.js"></script>
+    <script src="/static/docs.js"></script>
   </body>
 </html>

@@ -6,3 +6,4 @@ data/uploads/*
 data/history.json
 vector_store/*
 !vector_store/.gitkeep
+.env

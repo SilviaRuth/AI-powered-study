@@ -5,3 +5,4 @@ openai==1.68.2
 faiss-cpu==1.10.0
 numpy==2.2.3
 pypdf==5.4.0
+pytest==8.3.5

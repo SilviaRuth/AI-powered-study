@@ -1,0 +1,32 @@
+[
+  {
+    "question": "What is self-attention used for?",
+    "expected_answer": "It lets a token attend to other relevant tokens in the same sequence.",
+    "expected_documents": ["lecture_attention.txt"],
+    "expected_pages": []
+  },
+  {
+    "question": "How do recurrent neural networks differ from transformers?",
+    "expected_answer": "RNNs process tokens sequentially, while transformers use self-attention without recurrence.",
+    "expected_documents": ["lecture_rnn.txt", "lecture_attention.txt"],
+    "expected_pages": []
+  },
+  {
+    "question": "What helps improve long-term memory in the study notes?",
+    "expected_answer": "Spaced repetition improves long-term memory by scheduling reviews over increasing intervals.",
+    "expected_documents": ["study_skills.txt"],
+    "expected_pages": []
+  },
+  {
+    "question": "What do LSTMs improve in vanilla RNNs?",
+    "expected_answer": "They add gates that control memory updates.",
+    "expected_documents": ["lecture_rnn.txt"],
+    "expected_pages": []
+  },
+  {
+    "question": "What does the material say about convolutional kernels?",
+    "expected_answer": "I don't know",
+    "expected_documents": [],
+    "expected_pages": []
+  }
+]

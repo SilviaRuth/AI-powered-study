@@ -1,182 +1,200 @@
-﻿"""End-to-end RAG pipeline for the AI Knowledge Assistant."""
+"""End-to-end RAG pipeline orchestration."""
 
 from __future__ import annotations
 
-import json
-import os
+import logging
 import shutil
 import uuid
+from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import List, Tuple
 
 from fastapi import UploadFile
-from pypdf import PdfReader
-from pypdf.errors import PdfReadError
 
-from backend.rag.chunking import chunk_text
+from backend.core.config import Settings, get_settings
+from backend.core.exceptions import DocumentNotFoundError, IngestionError, RetrievalError
+from backend.rag.chunking import chunk_document
 from backend.rag.embeddings import OpenAIService
-from backend.rag.retriever import VectorStore
+from backend.rag.generation.answer_generator import AnswerGenerator
+from backend.rag.generation.citation_builder import CitationBuilder
+from backend.rag.generation.context_compressor import ContextCompressor
+from backend.rag.generation.prompt_builder import PromptBuilder
+from backend.rag.ingest import load_processed_chunks, save_processed_document
+from backend.rag.metadata import RetrievedChunk
+from backend.rag.parser import parse_document
+from backend.rag.query_rewrite import QueryRewriter
+from backend.rag.retrieval.bm25_retriever import BM25Retriever
+from backend.rag.retrieval.dedupe import dedupe_candidates
+from backend.rag.retrieval.dense_retriever import DenseRetriever
+from backend.rag.retrieval.hybrid_retriever import HybridRetriever
+from backend.rag.retrieval.reranker import Reranker
+from backend.rag.storage.bm25_store import BM25Store
+from backend.rag.storage.doc_registry import DocumentRegistry
+from backend.rag.storage.faiss_store import FaissStore
 
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-UPLOAD_DIR = BASE_DIR / "data" / "uploads"
-VECTOR_DIR = BASE_DIR / "vector_store"
-HISTORY_PATH = BASE_DIR / "data" / "history.json"
-SUPPORTED_EXTENSIONS = {".pdf", ".txt"}
-MIN_RELEVANCE_SCORE = float(os.getenv("MIN_RELEVANCE_SCORE", "0.2"))
+LOGGER = logging.getLogger(__name__)
 
 
-class KnowledgeAssistantPipeline:
+class AssistantPipeline:
     """Coordinates ingestion, retrieval, and answer generation."""
 
-    def __init__(self) -> None:
-        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        VECTOR_DIR.mkdir(parents=True, exist_ok=True)
-        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self.vector_store = VectorStore(VECTOR_DIR)
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+        self.settings.ensure_directories()
         self.openai_service = OpenAIService()
-        self.history = self._load_history()
-
-    def _load_history(self) -> List[dict]:
-        if HISTORY_PATH.exists():
-            return json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
-        return []
-
-    def _save_history(self) -> None:
-        HISTORY_PATH.write_text(
-            json.dumps(self.history, ensure_ascii=True, indent=2),
-            encoding="utf-8",
-        )
+        self.registry = DocumentRegistry(self.settings.registry_path)
+        self.dense_retriever = DenseRetriever(FaissStore(self.settings.dense_store_dir), self.openai_service)
+        self.sparse_retriever = BM25Retriever(BM25Store(self.settings.sparse_store_dir))
+        self.hybrid_retriever = HybridRetriever(self.dense_retriever, self.sparse_retriever)
+        self.reranker = Reranker(self.openai_service)
+        self.query_rewriter = QueryRewriter(self.openai_service)
+        self.context_compressor = ContextCompressor()
+        self.citation_builder = CitationBuilder()
+        self.answer_generator = AnswerGenerator(self.openai_service, PromptBuilder())
 
     async def ingest_upload(self, upload: UploadFile) -> dict:
-        """Save, parse, chunk, embed, and index an uploaded file."""
-        suffix = Path(upload.filename or "").suffix.lower()
-        if suffix not in SUPPORTED_EXTENSIONS:
+        """Save, parse, chunk, index, and register an uploaded document."""
+        original_filename = Path(upload.filename or "document").name
+        suffix = Path(original_filename).suffix.lower()
+        if suffix not in self.settings.supported_extensions:
             raise ValueError("Only PDF and TXT files are supported.")
 
-        filename = f"{uuid.uuid4().hex}_{Path(upload.filename or 'document').name}"
-        destination = UPLOAD_DIR / filename
+        document_id = f"doc_{uuid.uuid4().hex[:12]}"
+        stored_filename = f"{uuid.uuid4().hex}_{original_filename}"
+        destination = self.settings.upload_dir / stored_filename
 
         try:
             with destination.open("wb") as buffer:
                 shutil.copyfileobj(upload.file, buffer)
 
-            text = self._extract_text(destination)
-            if not text.strip():
+            parsed_document = parse_document(
+                destination,
+                filename=original_filename,
+                stored_filename=stored_filename,
+                document_id=document_id,
+            )
+            if not any(page.text.strip() for page in parsed_document.pages):
                 raise ValueError("The uploaded document is empty or contains no extractable text.")
 
-            chunks = chunk_text(text)
+            chunks = chunk_document(parsed_document)
             if not chunks:
                 raise ValueError("Unable to create chunks from the uploaded document.")
 
-            embeddings = self.openai_service.embed_texts(chunks)
-            metadata = [
+            save_processed_document(
+                self.settings.processed_dir,
+                document_id=document_id,
+                parsed_document=parsed_document.to_dict(),
+                chunks=chunks,
+            )
+            self.dense_retriever.index_chunks(chunks)
+            self.sparse_retriever.index_chunks(chunks)
+            self.registry.upsert(
                 {
-                    "filename": Path(upload.filename or filename).name,
-                    "stored_filename": filename,
-                    "chunk_id": chunk_id,
-                    "text": chunk,
+                    "document_id": document_id,
+                    "original_filename": original_filename,
+                    "stored_filename": stored_filename,
+                    "upload_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "source_type": parsed_document.source_type,
+                    "chunk_count": len(chunks),
+                    "status": "indexed",
+                    "tags": [],
                 }
-                for chunk_id, chunk in enumerate(chunks)
-            ]
-            self.vector_store.add_embeddings(embeddings, metadata)
-        except (PdfReadError, UnicodeDecodeError) as exc:
-            destination.unlink(missing_ok=True)
-            raise ValueError("The uploaded file could not be read as a valid document.") from exc
-        except ValueError:
-            destination.unlink(missing_ok=True)
-            raise
+            )
         except Exception as exc:
-            destination.unlink(missing_ok=True)
-            raise RuntimeError(f"Failed to process document: {exc}") from exc
+            self._cleanup_failed_document(document_id, destination)
+            if isinstance(exc, (IngestionError, ValueError)):
+                raise
+            raise IngestionError(f"Failed to process document: {exc}") from exc
 
         return {
             "message": "Document uploaded and indexed successfully.",
-            "filename": Path(upload.filename or filename).name,
+            "filename": original_filename,
+            "document_id": document_id,
             "chunks_indexed": len(chunks),
         }
 
-    def _extract_text(self, file_path: Path) -> str:
-        """Extract text from a supported file."""
-        if file_path.suffix.lower() == ".txt":
-            return file_path.read_text(encoding="utf-8", errors="ignore")
-        if file_path.suffix.lower() == ".pdf":
-            reader = PdfReader(str(file_path))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
-        raise ValueError("Unsupported file type.")
-
-    def answer_question(self, question: str) -> Tuple[str, List[dict]]:
-        """Retrieve relevant chunks and generate a grounded answer."""
+    def answer_question(self, question: str, history: list[dict]) -> tuple[str, list[dict], str]:
+        """Retrieve context, generate a grounded answer, and return cited sources."""
         cleaned_question = question.strip()
         if not cleaned_question:
             raise ValueError("Question cannot be empty.")
-        if not self.vector_store.metadata:
+        if not self.registry.list_documents():
             raise ValueError("Upload at least one document before asking questions.")
 
         try:
-            query_embedding = self.openai_service.embed_texts([cleaned_question])[0]
-            retrieved = self.vector_store.search(query_embedding, top_k=4)
+            rewritten_query, evidence = self.retrieve_candidates(cleaned_question, history)
+            answer, cited_ids = self.answer_generator.generate(cleaned_question, history, evidence)
+            final_answer = self.citation_builder.build_answer(answer, cited_ids, evidence)
+            sources = self.citation_builder.build_sources(cited_ids, evidence)
+            return final_answer, sources, rewritten_query
+        except ValueError:
+            raise
         except Exception as exc:
-            raise RuntimeError(f"Failed to retrieve context: {exc}") from exc
+            raise RetrievalError(f"Failed to answer question: {exc}") from exc
 
-        strong_matches = [item for item in retrieved if item[1] >= MIN_RELEVANCE_SCORE]
-        if not strong_matches:
-            answer = "I don't know"
-            self._append_history(cleaned_question, answer, [])
-            return answer, []
+    def retrieve_candidates(self, question: str, history: list[dict]) -> tuple[str, list[RetrievedChunk]]:
+        """Run retrieval, dedupe, reranking, compression, and citation labeling."""
+        rewritten_query = self.query_rewriter.rewrite(question, history)
+        candidates = self.hybrid_retriever.search(rewritten_query)
+        filtered = [
+            candidate
+            for candidate in candidates
+            if candidate.retrieval_score >= self.settings.min_relevance_score
+        ]
+        deduped = dedupe_candidates(filtered)
+        reranked = self.reranker.rerank(question, deduped)
+        compressed = self.context_compressor.compress(question, reranked[: self.settings.top_k])
+        labeled = self.citation_builder.assign_labels(compressed)
+        return rewritten_query, labeled
 
-        context_parts = []
-        sources = []
-        for item, score in strong_matches:
-            context_parts.append(
-                f"[{item['filename']} | chunk {item['chunk_id']}]\n{item['text']}"
-            )
-            sources.append(
-                {
-                    "filename": item["filename"],
-                    "chunk_id": item["chunk_id"],
-                    "score": round(score, 4),
-                    "excerpt": item["text"][:240],
-                }
-            )
+    def list_documents(self) -> list[dict]:
+        """List indexed documents."""
+        return self.registry.list_documents()
 
-        history_text = "\n".join(
-            f"User: {entry['question']}\nAssistant: {entry['answer']}"
-            for entry in self.history[-5:]
-        )
-        try:
-            answer = self.openai_service.answer_with_context(
-                question=cleaned_question,
-                context="\n\n".join(context_parts),
-                history=history_text,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Failed to generate answer: {exc}") from exc
+    def delete_document(self, document_id: str) -> None:
+        """Delete a document's registry entry and index data."""
+        record = self.registry.get(document_id)
+        if record is None:
+            raise DocumentNotFoundError(f"Document {document_id} was not found.")
 
-        if not answer:
-            answer = "I don't know"
+        self.dense_retriever.delete_document(document_id)
+        self.sparse_retriever.delete_document(document_id)
+        self.registry.delete(document_id)
 
-        self._append_history(cleaned_question, answer, sources)
-        return answer, sources
+        upload_path = self.settings.upload_dir / record["stored_filename"]
+        processed_path = self.settings.processed_dir / f"{document_id}.json"
+        upload_path.unlink(missing_ok=True)
+        processed_path.unlink(missing_ok=True)
 
-    def _append_history(self, question: str, answer: str, sources: List[dict]) -> None:
-        self.history.append(
-            {
-                "question": question,
-                "answer": answer,
-                "sources": sources,
-            }
-        )
-        self._save_history()
+    def rebuild_indexes(self) -> int:
+        """Rebuild dense and sparse indexes from processed artifacts."""
+        self.dense_retriever.clear()
+        self.sparse_retriever.clear()
+        count = 0
+        for processed_path in sorted(self.settings.processed_dir.glob("doc_*.json")):
+            chunks = load_processed_chunks(processed_path)
+            if not chunks:
+                continue
+            self.dense_retriever.index_chunks(chunks)
+            self.sparse_retriever.index_chunks(chunks)
+            count += 1
+        LOGGER.info("Rebuilt indexes for %s processed documents", count)
+        return count
 
-    def get_history(self) -> List[dict]:
-        """Return saved chat history."""
-        return self.history
-
-    def clear_history(self) -> None:
-        """Remove saved chat history."""
-        self.history = []
-        self._save_history()
+    def _cleanup_failed_document(self, document_id: str, upload_path: Path) -> None:
+        upload_path.unlink(missing_ok=True)
+        processed_path = self.settings.processed_dir / f"{document_id}.json"
+        processed_path.unlink(missing_ok=True)
+        self.dense_retriever.delete_document(document_id)
+        self.sparse_retriever.delete_document(document_id)
+        self.registry.delete(document_id)
 
 
-assistant_pipeline = KnowledgeAssistantPipeline()
+@lru_cache(maxsize=1)
+def get_assistant_pipeline() -> AssistantPipeline:
+    """Return a shared pipeline instance."""
+    return AssistantPipeline()
+
+
+assistant_pipeline = get_assistant_pipeline()

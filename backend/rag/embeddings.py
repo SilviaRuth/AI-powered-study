@@ -1,32 +1,29 @@
-﻿"""OpenAI embedding and answer generation helpers."""
+"""OpenAI integration helpers."""
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Iterable, List
+import re
+from typing import Iterable
 
 from openai import OpenAI
 
-
-DEFAULT_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-DEFAULT_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+from backend.core.config import get_settings
 
 
 class OpenAIService:
-    """Thin wrapper around OpenAI API calls used by the RAG pipeline."""
+    """Thin wrapper around the OpenAI APIs used by the RAG stack."""
 
-    def __init__(
-        self,
-        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-        chat_model: str = DEFAULT_CHAT_MODEL,
-    ) -> None:
-        self.embedding_model = embedding_model
-        self.chat_model = chat_model
+    def __init__(self) -> None:
+        settings = get_settings()
+        self.embedding_model = settings.openai_embedding_model
+        self.chat_model = settings.openai_chat_model
         self._client: OpenAI | None = None
 
     @property
     def client(self) -> OpenAI:
-        """Lazily create the API client so imports work without env vars set."""
+        """Lazily construct the client."""
         if self._client is None:
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
@@ -34,9 +31,9 @@ class OpenAIService:
             self._client = OpenAI(api_key=api_key)
         return self._client
 
-    def embed_texts(self, texts: Iterable[str]) -> List[List[float]]:
-        """Generate embeddings for a list of texts."""
-        prepared = list(texts)
+    def embed_texts(self, texts: Iterable[str]) -> list[list[float]]:
+        """Embed a batch of texts."""
+        prepared = [text for text in texts if text.strip()]
         if not prepared:
             return []
         response = self.client.embeddings.create(
@@ -45,18 +42,19 @@ class OpenAIService:
         )
         return [item.embedding for item in response.data]
 
-    def answer_with_context(self, question: str, context: str, history: str) -> str:
-        """Generate a grounded answer that only uses retrieved context."""
-        prompt = (
-            "You are an AI assistant.\n"
-            "Answer ONLY using the provided context.\n"
-            "If the answer is not in the context, say \"I don't know\".\n\n"
-            f"CHAT HISTORY:\n{history or 'No previous conversation.'}\n\n"
-            f"CONTEXT:\n{context}\n\n"
-            f"QUESTION:\n{question}"
-        )
+    def complete_text(self, prompt: str) -> str:
+        """Generate plain text output."""
         response = self.client.responses.create(
             model=self.chat_model,
             input=prompt,
         )
         return response.output_text.strip()
+
+    def complete_json(self, prompt: str) -> dict:
+        """Generate a JSON object and parse it defensively."""
+        raw = self.complete_text(prompt)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        return json.loads(cleaned)
